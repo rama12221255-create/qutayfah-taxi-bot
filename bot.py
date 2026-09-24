@@ -219,7 +219,7 @@ def driver_keyboard():
         [
             [KeyboardButton("🟢 تشغيل"), KeyboardButton("🔴 إيقاف")],
             [KeyboardButton("📍 إرسال موقعي", request_location=True)],
-            [KeyboardButton("🚕 الرحلة الحالية")],
+            [KeyboardButton("🚕 الرحلة الحالية"), KeyboardButton("🏁 إنهاء الرحلة")],
             [KeyboardButton("📊 إحصائياتي")],
             [KeyboardButton("❓ المساعدة")],
         ],
@@ -431,7 +431,6 @@ async def driver_license(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
-    # إرسال البيانات إلى المالك بشكل خاص
     if OWNER_ID:
         try:
             if license_file_id:
@@ -632,8 +631,6 @@ async def send_ride_to_drivers_group(
     pickup_lat,
     pickup_lon,
 ):
-    """إرسال طلب الرحلة إلى مجموعة السائقين فقط."""
-
     if not DRIVERS_GROUP_ID:
         logger.error("DRIVERS_GROUP_ID غير مضبوط؛ لا يمكن إرسال طلب الرحلة للمجموعة.")
         return False
@@ -666,7 +663,6 @@ async def send_ride_to_drivers_group(
             reply_markup=keyboard,
         )
 
-        # إرسال موقع الراكب كرسالة موقع مستقلة داخل المجموعة
         await context.bot.send_location(
             chat_id=DRIVERS_GROUP_ID,
             latitude=pickup_lat,
@@ -764,10 +760,6 @@ async def ride_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ride_id = cur.lastrowid
     conn.commit()
     conn.close()
-
-    # ========================================================
-    # إرسال الطلب إلى مجموعة السائقين
-    # ========================================================
 
     sent_to_group = await send_ride_to_drivers_group(
         context,
@@ -921,6 +913,67 @@ async def accept_ride(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# إنهاء الرحلة الحالية (مضاف جديد)
+# ============================================================
+
+async def driver_complete_current_ride(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    driver_id = update.effective_user.id
+
+    conn = get_db()
+    ride = conn.execute("""
+        SELECT *
+        FROM rides
+        WHERE driver_id = ?
+          AND status = 'accepted'
+        ORDER BY id DESC
+        LIMIT 1
+    """, (driver_id,)).fetchone()
+
+    if not ride:
+        conn.close()
+        await update.message.reply_text("📭 لا توجد لديك رحلة حالية لتنهيها.")
+        return
+
+    ride_id = ride["id"]
+    passenger_id = ride["passenger_id"]
+
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE rides
+        SET status = 'completed',
+            completed_at = ?
+        WHERE id = ?
+    """, (now(), ride_id))
+
+    conn.execute("""
+        UPDATE drivers
+        SET current_ride = NULL
+        WHERE user_id = ?
+    """, (driver_id,))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"🏁 تم إنهاء الرحلة #{ride_id} بنجاح.\nيمكنك الآن استقبال طلبات جديدة.",
+        reply_markup=driver_keyboard(),
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=passenger_id,
+            text=(
+                f"🏁 تم إتمام الرحلة #{ride_id} بنجاح!\n\n"
+                "شكراً لاستخدامك بوت وصلني 🙏\n"
+                "يمكنك الآن طلب سيارة جديدة بكل سهولة عبر الضغط على زر «🚕 طلب سيارة»."
+            ),
+            reply_markup=passenger_keyboard(),
+        )
+    except Exception as exc:
+        logger.error("خطأ في إبلاغ الراكب بإنهاء الرحلة: %s", exc)
+
+
+# ============================================================
 # الرحلة الحالية والإحصائيات
 # ============================================================
 
@@ -950,6 +1003,8 @@ async def current_ride(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📍 موقع الراكب:
 {ride['pickup']}
+
+اضغط على زر «🏁 إنهاء الرحلة» من لوحة التحكم عند وصول الراكب لتتمكن من استقبال طلبات جديدة.
 """
     )
 
@@ -1108,6 +1163,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 4️⃣ اضغط «📍 إرسال موقعي»
 5️⃣ ستظهر طلبات الرحلات في مجموعة السائقين.
 6️⃣ اضغط «🚕 تنفيذ الطلب» على الطلب الذي تريد تنفيذه.
+7️⃣ عند الوصول وانهاء الرحلة، اضغط «🏁 إنهاء الرحلة» ليتمكن الراكب من طلب رحلة جديدة.
 
 📊 إحصائيات المالك:
 /statistics
@@ -1208,6 +1264,9 @@ def main():
         MessageHandler(filters.Regex("^🔴 إيقاف$"), driver_offline)
     )
     application.add_handler(
+        MessageHandler(filters.Regex("^🏁 إنهاء الرحلة$"), driver_complete_current_ride)
+    )
+    application.add_handler(
         MessageHandler(filters.Regex("^🚕 الرحلة الحالية$"), current_ride)
     )
     application.add_handler(
@@ -1220,7 +1279,6 @@ def main():
         MessageHandler(filters.Regex("^❓ المساعدة$"), help_command)
     )
 
-    # استقبال مواقع السائقين فقط خارج محادثة طلب الراكب
     application.add_handler(
         MessageHandler(filters.LOCATION, driver_location)
     )
