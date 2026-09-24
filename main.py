@@ -20,7 +20,7 @@ from telegram.ext import (
     ContextTypes
 )
 
-# ----------------- خادم وهمي لمنع إيقاف الاستضافة -----------------
+# ----------------- خادم وهمي لمنع إيقاف الاستضافة (Render/Replit) -----------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -41,8 +41,8 @@ DRIVERS_GROUP_ID = int(os.environ.get("DRIVERS_GROUP_ID", -1001234567890))
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # مراحل المحادثات
-RIDE_PICKUP = 0
-DRIVER_NAME, DRIVER_PHONE, DRIVER_CAR, DRIVER_LICENSE = range(1, 5)
+RIDE_PICKUP, RIDE_DESTINATION, RIDE_COST = range(3)
+DRIVER_NAME, DRIVER_PHONE, DRIVER_CAR, DRIVER_LICENSE = range(3, 7)
 
 # ----------------- قوائم لوحات المفاتيح (Keyboards) -----------------
 
@@ -53,6 +53,7 @@ def passenger_main_menu():
         ["🆔 تسجيل كسائق جديد"],
         ["❓ المساعدة والدعم"]
     ]
+    # is_persistent=True تُثبت القائمة وتمنع إخفاءها تلقائياً
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
 
 def driver_menu():
@@ -87,7 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"أهلاً بك كابتن **{driver_info['name']}** 🚖 في تطبيق **وصلني**!\n\n"
             f"🚘 **سيارتك:** {driver_info['car']}\n"
             f"📞 **رقم هاتفك:** `{driver_info['phone']}`\n\n"
-            f"ستصلك طلبات الركاب في مجموعة السائقين لتحديد الكلفة وقبول الرحلات."
+            f"ستصلك طلبات الركاب في مجموعة السائقين فور إرسالها."
         )
         await update.message.reply_text(msg, reply_markup=driver_menu(), parse_mode="Markdown")
     else:
@@ -98,15 +99,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(msg, reply_markup=passenger_main_menu(), parse_mode="Markdown")
 
-# ----------------- مسار طلب رحلة للراكب (بدون وجهة وبدون كلفة) -----------------
+# ----------------- مسار طلب رحلة للراكب -----------------
 
 async def start_ride_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     location_btn = KeyboardButton(text="📍 مشاركة موقعي الحالي", request_location=True)
     markup = ReplyKeyboardMarkup([[location_btn], ["❌ إلغاء"]], resize_keyboard=True, one_time_keyboard=True)
 
     await update.message.reply_text(
-        "حدد **نقطة الانطلاق** 📍\n"
-        "(أرسل موقعك المباشر عبر الخريطة أو اكتب العنوان نصياً):",
+        "الخطوة 1️⃣: حدد **نقطة الانطلاق**\n"
+        "(أرسل موقعك المباشر أو اكتب العنوان نصياً):",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -116,38 +117,77 @@ async def get_ride_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "❌ إلغاء":
         return await cancel_conversation(update, context)
 
+    if update.message.location:
+        context.user_data['pickup'] = "موقع على الخريطة 📍"
+        context.user_data['pickup_location'] = update.message.location
+    else:
+        context.user_data['pickup'] = update.message.text
+        context.user_data['pickup_location'] = None
+
+    cancel_btn = ReplyKeyboardMarkup([["❌ إلغاء"]], resize_keyboard=True)
+    await update.message.reply_text(
+        "تم تحديد الانطلاق! ✅\n\n"
+        "الخطوة 2️⃣: اكتب **نقطة الوصول (الوجهة)**\n"
+        "(مثال: المشفى الوطني، ساحة البلدية...):",
+        reply_markup=cancel_btn,
+        parse_mode="Markdown"
+    )
+    return RIDE_DESTINATION
+
+async def get_ride_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ إلغاء":
+        return await cancel_conversation(update, context)
+
+    context.user_data['destination'] = update.message.text
+
+    cost_buttons = [
+        ["15,000 ل.س", "20,000 ل.س"],
+        ["25,000 ل.س", "30,000 ل.س"],
+        ["❌ إلغاء"]
+    ]
+    markup = ReplyKeyboardMarkup(cost_buttons, resize_keyboard=True, one_time_keyboard=True)
+
+    await update.message.reply_text(
+        "الخطوة 3️⃣: اختر أو اكتب **الكلفة التقديرية للرحلة** 💰:",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
+    return RIDE_COST
+
+async def get_ride_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "❌ إلغاء":
+        return await cancel_conversation(update, context)
+
+    cost = update.message.text
     user = update.message.from_user
     order_id = update.message.message_id
 
-    if update.message.location:
-        pickup = "موقع محدد على الخريطة 📍"
-        pickup_loc = update.message.location
-    else:
-        pickup = update.message.text
-        pickup_loc = None
+    pickup = context.user_data.get('pickup', 'غير محدد')
+    destination = context.user_data.get('destination', 'غير محدد')
+    pickup_loc = context.user_data.get('pickup_location')
 
     if 'orders' not in context.bot_data:
         context.bot_data['orders'] = {}
 
     context.bot_data['orders'][order_id] = {
-        "order_id": order_id,
         "passenger_id": user.id,
         "passenger_name": user.first_name,
         "pickup": pickup,
-        "pickup_location": pickup_loc,
-        "status": "pending",
-        "group_msg_id": None
+        "destination": destination,
+        "cost": cost,
+        "status": "pending"
     }
 
     await update.message.reply_text(
         f"✅ **تم إرسال طلب الرحلة بنجاح!**\n\n"
-        f"📍 **نقطة الانطلاق:** {pickup}\n\n"
-        f"جاري البحث عن كابتن وتحديد الكلفة التقديرية... سنخبرك فور قبول الطلب.",
+        f"📍 **الانطلاق:** {pickup}\n"
+        f"🏁 **الوجهة:** {destination}\n"
+        f"💰 **الكلفة التقديرية:** {cost}\n\n"
+        f"جاري البحث عن كابتن... سنقوم بتبليغك فور قبول طلبك.",
         reply_markup=passenger_main_menu(),
         parse_mode="Markdown"
     )
 
-    # إرسال موقع الانطلاق إن وجد إلى مجموعة السائقين
     if pickup_loc:
         try:
             await context.bot.send_location(
@@ -159,168 +199,25 @@ async def get_ride_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"خطأ في إرسال الموقع: {e}")
 
     accept_btn = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💰 تحديد الكلفة وقبول الرحلة", callback_data=f"set_cost_{order_id}")
+        InlineKeyboardButton("✅ قبول الرحلة", callback_data=f"accept_ride_{order_id}")
     ]])
 
     order_msg = (
         f"🔔 **طلب رحلة جديد! (#طلب_{order_id})**\n\n"
         f"👤 **الراكب:** {user.first_name}\n"
-        f"📍 **نقطة الانطلاق:** {pickup}\n\n"
-        f"👇 يرجى النقر على الزر أدناه لتحديد الكلفة التقديرية وقبول الطلب."
+        f"📍 **الانطلاق:** {pickup}\n"
+        f"🏁 **الوجهة:** {destination}\n"
+        f"💰 **الكلفة التقديرية:** {cost}"
     )
 
-    sent_msg = await context.bot.send_message(
+    await context.bot.send_message(
         chat_id=DRIVERS_GROUP_ID,
         text=order_msg,
         reply_markup=accept_btn,
         parse_mode="Markdown"
     )
 
-    context.bot_data['orders'][order_id]['group_msg_id'] = sent_msg.message_id
-
     return ConversationHandler.END
-
-# ----------------- تحديد الكلفة والقبول من قبل السائق -----------------
-
-async def handle_set_cost_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    driver_user = query.from_user
-    order_id = int(query.data.rsplit("_", 1)[1])
-
-    approved_drivers = context.bot_data.get('approved_drivers', {})
-
-    if driver_user.id not in approved_drivers or approved_drivers[driver_user.id].get('status') != 'approved':
-        await query.answer("⚠️ عذراً! يجب أن تكون سائقاً معتمداً لتحديد الكلفة وقبول الرحلات.", show_alert=True)
-        return
-
-    orders = context.bot_data.get('orders', {})
-    order = orders.get(order_id)
-
-    if not order or order.get('status') != 'pending':
-        await query.answer("⚠️ عذراً، تم قبول هذه الرحلة مسبقاً من قبل سائق آخر!", show_alert=True)
-        return
-
-    await query.answer()
-
-    # حفظ معرّف الطلب في جلسة السائق
-    context.user_data['pending_cost_order_id'] = order_id
-
-    # أزرار كلفة سريعة مع إمكانية الكتابة النصية في خاص البوت
-    quick_costs = [
-        [InlineKeyboardButton("15,000 ل.س", callback_data=f"costval_{order_id}_15,000 ل.س"),
-         InlineKeyboardButton("20,000 ل.س", callback_data=f"costval_{order_id}_20,000 ل.س")],
-        [InlineKeyboardButton("25,000 ل.س", callback_data=f"costval_{order_id}_25,000 ل.س"),
-         InlineKeyboardButton("30,000 ل.س", callback_data=f"costval_{order_id}_30,000 ل.س")]
-    ]
-    markup = InlineKeyboardMarkup(quick_costs)
-
-    try:
-        await context.bot.send_message(
-            chat_id=driver_user.id,
-            text=f"🚖 **تحديد الكلفة التقديرية للطلب (#طلب_{order_id}):**\n\n"
-                 f"📍 **نقطة الانطلاق:** {order['pickup']}\n\n"
-                 f"اختر الكلفة من الأزرار السريعة أدناه، أو **اكتب المبلغ نصياً** وأرسله هنا مباشرة:",
-            reply_markup=markup,
-            parse_mode="Markdown"
-        )
-    except Exception:
-        await context.bot.send_message(
-            chat_id=DRIVERS_GROUP_ID,
-            text=f"⚠️ الكابتن [{driver_user.first_name}](tg://user?id={driver_user.id}) يرجى بدء المحادثة في الخاص مع البوت أولاً لتمكن من إدخال الكلفة!",
-            parse_mode="Markdown"
-        )
-
-async def handle_private_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة إدخال السائق للكلفة نصياً في المحادثة الخاصة"""
-    order_id = context.user_data.get('pending_cost_order_id')
-    if order_id:
-        cost_text = update.message.text
-        user_id = update.effective_user.id
-        await finalize_ride_acceptance(update, context, order_id, user_id, cost_text)
-        context.user_data['pending_cost_order_id'] = None
-
-async def handle_cost_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة اختيار السائق للكلفة عبر الأزرار السريعة"""
-    query = update.callback_query
-    data_parts = query.data.split("_", 2)
-    order_id = int(data_parts[1])
-    cost_text = data_parts[2]
-
-    await query.answer()
-    await finalize_ride_acceptance(update, context, order_id, query.from_user.id, cost_text)
-
-async def finalize_ride_acceptance(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id: int, driver_id: int, cost_text: str):
-    orders = context.bot_data.get('orders', {})
-    order = orders.get(order_id)
-
-    if not order or order.get('status') != 'pending':
-        msg = "⚠️ عذراً، تم قبول هذه الرحلة مسبقاً من قبل سائق آخر!"
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg)
-        elif update.message:
-            await update.message.reply_text(msg)
-        return
-
-    approved_drivers = context.bot_data.get('approved_drivers', {})
-    driver_info = approved_drivers.get(driver_id)
-
-    if not driver_info:
-        return
-
-    order['status'] = 'accepted'
-    order['cost'] = cost_text
-    order['driver_id'] = driver_id
-
-    # 1. تحديث الرسالة في مجموعة السائقين
-    group_msg_text = (
-        f"✅ **تم قبول الرحلة (#طلب_{order_id})**\n\n"
-        f"👤 **الراكب:** {order['passenger_name']}\n"
-        f"📍 **الانطلاق:** {order['pickup']}\n"
-        f"💰 **الكلفة التقديرية:** {cost_text}\n\n"
-        f"🚖 **الكابتن:** {driver_info['name']}\n"
-        f"📞 **هاتف السائق:** `{driver_info['phone']}`\n"
-        f"🚘 **السيارة:** {driver_info['car']}"
-    )
-
-    try:
-        await context.bot.edit_message_text(
-            chat_id=DRIVERS_GROUP_ID,
-            message_id=order['group_msg_id'],
-            text=group_msg_text,
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error(f"خطأ في تعديل رسالة المجموعة: {e}")
-
-    # 2. تأكيد للسائق
-    confirm_driver_msg = (
-        f"✅ **تم إرسال قبولك وتحديد الكلفة بنجاح!**\n\n"
-        f"💰 **الكلفة المحددة:** {cost_text}\n"
-        f"📍 **نقطة الانطلاق:** {order['pickup']}\n"
-        f"👤 **اسم الراكب:** {order['passenger_name']}"
-    )
-    if update.callback_query:
-        await update.callback_query.edit_message_text(confirm_driver_msg, parse_mode="Markdown")
-    elif update.message:
-        await update.message.reply_text(confirm_driver_msg, parse_mode="Markdown")
-
-    # 3. إشعار للراكب مع إظهار القائمة الرئيسية
-    passenger_notification = (
-        f"🎉 **تم قبول طلبك! الكابتن {driver_info['name']} في طريقه إليك** 🚖\n\n"
-        f"👤 **اسم السائق:** {driver_info['name']}\n"
-        f"📞 **رقم الهاتف:** `{driver_info['phone']}`\n"
-        f"🚘 **نوع السيارة:** {driver_info['car']}\n"
-        f"💰 **الكلفة التقديرية للرحلة:** {cost_text}\n\n"
-        f"📍 **نقطة الانطلاق:** {order['pickup']}\n\n"
-        f"نتمنى لك رحلة آمنة وسعيدة! 😊"
-    )
-
-    await context.bot.send_message(
-        chat_id=order['passenger_id'],
-        text=passenger_notification,
-        reply_markup=passenger_main_menu(),
-        parse_mode="Markdown"
-    )
 
 # ----------------- مسار تسجيل السائق الجديد -----------------
 
@@ -456,7 +353,7 @@ async def handle_driver_approval(update: Update, context: ContextTypes.DEFAULT_T
         await context.bot.send_message(
             chat_id=target_user_id,
             text=f"🎉 **تهانينا كابتن {pending['name']}!**\n"
-                 f"تم قبول وتفعيل حسابك كسائق معتمد في بوت **وصلني**. يمكنك الآن قبول الرحلات وتحديد الكلفة مباشرة من مجموعة السائقين!",
+                 f"تم قبول وتفعيل حسابك كسائق معتمد في بوت **وصلني**. يمكنك الآن قبول الرحلات مباشرة من مجموعة السائقين!",
             reply_markup=driver_menu(),
             parse_mode="Markdown"
         )
@@ -470,6 +367,62 @@ async def handle_driver_approval(update: Update, context: ContextTypes.DEFAULT_T
             text="عذراً، تم رفض طلب تسجيلك كسائق حالياً. يمكنك التواصل مع الدعم لمزيد من التفاصيل.",
             reply_markup=passenger_main_menu()
         )
+
+# ----------------- معالجة قبول الرحلة من السائق -----------------
+
+async def handle_ride_acceptance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    driver_user = query.from_user
+    order_id = int(query.data.rsplit("_", 1)[1])
+
+    approved_drivers = context.bot_data.get('approved_drivers', {})
+
+    if driver_user.id not in approved_drivers or approved_drivers[driver_user.id].get('status') != 'approved':
+        await query.answer("⚠️ عذراً! يجب أن تكون سائقاً معتمداً ومقبولاً للتمكن من قبول الرحلات.", show_alert=True)
+        return
+
+    await query.answer()
+
+    orders = context.bot_data.get('orders', {})
+    order = orders.get(order_id)
+
+    if not order or order.get('status') != 'pending':
+        await query.edit_message_text("⚠️ عذراً، تم قبول هذه الرحلة مسبقاً من قبل سائق آخر!")
+        return
+
+    order['status'] = 'accepted'
+    driver_info = approved_drivers[driver_user.id]
+
+    await query.edit_message_text(
+        f"✅ **تم قبول الرحلة (#طلب_{order_id})**\n\n"
+        f"👤 **الراكب:** {order['passenger_name']}\n"
+        f"📍 **الانطلاق:** {order['pickup']}\n"
+        f"🏁 **الوجهة:** {order['destination']}\n"
+        f"💰 **الكلفة:** {order['cost']}\n\n"
+        f"🚖 **الكابتن:** {driver_info['name']}\n"
+        f"📞 **هاتف السائق:** `{driver_info['phone']}`\n"
+        f"🚘 **السيارة:** {driver_info['car']}",
+        parse_mode="Markdown"
+    )
+
+    passenger_notification = (
+        f"🎉 **تم قبول طلبك! الكابتن {driver_info['name']} في طريقه إليك** 🚖\n\n"
+        f"👤 **اسم السائق:** {driver_info['name']}\n"
+        f"📞 **رقم الهاتف:** `{driver_info['phone']}`\n"
+        f"🚘 **نوع السيارة:** {driver_info['car']}\n"
+        f"💰 **التكلفة المقدرة:** {order['cost']}\n\n"
+        f"📍 **الانطلاق:** {order['pickup']}\n"
+        f"🏁 **الوجهة:** {order['destination']}\n\n"
+        f"نتمنى لك رحلة آمنة وسعيدة! 😊"
+    )
+
+    # إعادة إرسال القائمة الرئيسية للراكب فور إشعاره بحدث قبول الطلب
+    await context.bot.send_message(
+        chat_id=order['passenger_id'],
+        text=passenger_notification,
+        reply_markup=passenger_main_menu(),
+        parse_mode="Markdown"
+    )
 
 # ----------------- عرض البيانات والمساعدة -----------------
 
@@ -495,8 +448,8 @@ async def show_driver_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "❓ **دليل استخدام بوت وصلني:**\n\n"
-        "1️⃣ **للركاب:** اضغط `🚖 طلب رحلة جديد` وقم بإرسال موقع الانطلاق فقط.\n"
-        "2️⃣ **للسائقين:** اضغط `🆔 تسجيل كسائق جديد` وأدخل بياناتك. بعد الموافقة ستتمكن من تحديد كلفة الرحلة وقبول الطلبات بنقرة زر!"
+        "1️⃣ **للركاب:** اضغط `🚖 طلب رحلة جديد` واتبع الخطوات الثلاث (الانطلاق، الوجهة، السعر التقديري).\n"
+        "2️⃣ **للسائقين:** اضغط `🆔 تسجيل كسائق جديد` وأدخل بياناتك. بعد الموافقة ستتمكن من قبول الطلبات مباشرة بنقرة زر!"
     )
     await update.message.reply_text(help_text, reply_markup=passenger_main_menu(), parse_mode="Markdown")
 
@@ -518,6 +471,8 @@ if __name__ == '__main__':
         ],
         states={
             RIDE_PICKUP: [MessageHandler(filters.LOCATION | (filters.TEXT & ~filters.COMMAND), get_ride_pickup)],
+            RIDE_DESTINATION: [MessageHandler(filters.LOCATION | (filters.TEXT & ~filters.COMMAND), get_ride_destination)],
+            RIDE_COST: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_ride_cost)],
         },
         fallbacks=[
             CommandHandler('cancel', cancel_conversation),
@@ -551,9 +506,6 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.Regex("^❓ المساعدة والدعم$"), help_cmd))
 
     app.add_handler(CallbackQueryHandler(handle_driver_approval, pattern="^(approve_driver|reject_driver)_"))
-    app.add_handler(CallbackQueryHandler(handle_set_cost_click, pattern="^set_cost_"))
-    app.add_handler(CallbackQueryHandler(handle_cost_button_click, pattern="^costval_"))
-    
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_private_text_messages))
+    app.add_handler(CallbackQueryHandler(handle_ride_acceptance, pattern="^accept_ride_"))
 
     app.run_polling()
