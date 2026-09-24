@@ -1,10 +1,10 @@
 import os
-import logging
-import sqlite3
-import threading
 import math
+import sqlite3
+import logging
+import threading
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import (
     Update,
@@ -12,7 +12,6 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    BotCommand,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -24,66 +23,48 @@ from telegram.ext import (
     filters,
 )
 
-
 # ============================================================
-# إعدادات المشروع
+# إعدادات البوت
 # ============================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 CITY_NAME = os.environ.get("CITY_NAME", "القطيفة")
-
 DB_FILE = os.environ.get("DB_FILE", "waselni.db")
-
 PORT = int(os.environ.get("PORT", "10000"))
-
-
-# ============================================================
-# Logging
-# ============================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger("waselni")
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Health Check
+# Health Check - Render
 # ============================================================
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
+class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(
-            f"وصلني يعمل - {CITY_NAME}".encode("utf-8")
-        )
+        self.wfile.write(b"Waselni Bot is running!")
 
     def log_message(self, format, *args):
         return
 
 
 def run_health_server():
-
-    server = HTTPServer(
-        ("0.0.0.0", PORT),
-        HealthCheckHandler
-    )
-
-    logger.info(f"Health server running on port {PORT}")
-
-    server.serve_forever()
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        logger.info(f"Health server running on port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
 
 
 threading.Thread(
@@ -93,95 +74,73 @@ threading.Thread(
 
 
 # ============================================================
-# Database
+# قاعدة البيانات
 # ============================================================
 
-db_lock = threading.Lock()
-
-
 def get_db():
-
     conn = sqlite3.connect(
         DB_FILE,
         check_same_thread=False
     )
-
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
-def init_database():
+def init_db():
 
-    with db_lock:
+    conn = get_db()
+    cur = conn.cursor()
 
-        conn = get_db()
-
-        cursor = conn.cursor()
-
-        # المستخدمون
-        cursor.execute("""
+    # المستخدمين
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            telegram_id INTEGER UNIQUE NOT NULL,
+            user_id INTEGER PRIMARY KEY,
             first_name TEXT,
             username TEXT,
             phone TEXT,
-            role TEXT DEFAULT 'passenger',
             created_at TEXT
         )
-        """)
+    """)
 
-        # السائقون
-        cursor.execute("""
+    # السائقين
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS drivers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER UNIQUE NOT NULL,
-            name TEXT NOT NULL,
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
             phone TEXT,
             car TEXT,
             license TEXT,
+            license_file_id TEXT,
             status TEXT DEFAULT 'pending',
             online INTEGER DEFAULT 0,
-            latitude REAL,
-            longitude REAL,
-            rating REAL DEFAULT 5.0,
-            total_rides INTEGER DEFAULT 0,
-            created_at TEXT
+            lat REAL,
+            lon REAL,
+            current_ride INTEGER,
+            created_at TEXT,
+            approved_at TEXT
         )
-        """)
+    """)
 
-        # الرحلات
-        cursor.execute("""
+    # الرحلات
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS rides (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            passenger_id INTEGER NOT NULL,
-
-            pickup_text TEXT,
-            destination_text TEXT,
-
+            passenger_id INTEGER,
+            pickup TEXT,
+            destination TEXT,
             pickup_lat REAL,
             pickup_lon REAL,
-
-            destination_lat REAL,
-            destination_lon REAL,
-
-            estimated_price INTEGER DEFAULT 0,
-
+            price REAL,
             status TEXT DEFAULT 'searching',
-
             driver_id INTEGER,
-
             created_at TEXT,
             accepted_at TEXT,
-            started_at TEXT,
             completed_at TEXT
         )
-        """)
+    """)
 
-        # تقييمات
-        cursor.execute("""
+    # التقييمات
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS ratings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ride_id INTEGER,
@@ -191,463 +150,54 @@ def init_database():
             comment TEXT,
             created_at TEXT
         )
-        """)
+    """)
 
-        conn.commit()
+    conn.commit()
+    conn.close()
 
-        conn.close()
 
-
-init_database()
+init_db()
 
 
 # ============================================================
-# Helpers
+# أدوات مساعدة
 # ============================================================
 
 def now():
-
-    return datetime.utcnow().isoformat()
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def save_user(user):
 
-    with db_lock:
+    conn = get_db()
 
-        conn = get_db()
-
-        conn.execute("""
-        INSERT INTO users
-        (
-            telegram_id,
+    conn.execute("""
+        INSERT INTO users (
+            user_id,
             first_name,
             username,
             created_at
         )
         VALUES (?, ?, ?, ?)
 
-        ON CONFLICT(telegram_id)
+        ON CONFLICT(user_id)
         DO UPDATE SET
-            first_name=excluded.first_name,
-            username=excluded.username
-        """, (
-            user.id,
-            user.first_name or "",
-            user.username or "",
-            now()
-        ))
+            first_name = excluded.first_name,
+            username = excluded.username
+    """, (
+        user.id,
+        user.first_name or "",
+        user.username or "",
+        now()
+    ))
 
-        conn.commit()
-        conn.close()
-
-
-def get_driver(telegram_id):
-
-    conn = get_db()
-
-    row = conn.execute("""
-    SELECT *
-    FROM drivers
-    WHERE telegram_id=?
-    """, (telegram_id,)).fetchone()
-
+    conn.commit()
     conn.close()
 
-    return row
 
+def haversine(lat1, lon1, lat2, lon2):
 
-def get_ride(ride_id):
-
-    conn = get_db()
-
-    row = conn.execute("""
-    SELECT *
-    FROM rides
-    WHERE id=?
-    """, (ride_id,)).fetchone()
-
-    conn.close()
-
-    return row
-
-
-# ============================================================
-# Keyboards
-# ============================================================
-
-def passenger_menu():
-
-    keyboard = [
-
-        ["🚖 طلب رحلة جديدة"],
-
-        ["📍 رحلتي الحالية"],
-
-        ["📜 رحلاتي السابقة"],
-
-        ["🚕 التسجيل كسائق"],
-
-        ["❓ المساعدة"]
-
-    ]
-
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        is_persistent=True
-    )
-
-
-def driver_menu():
-
-    keyboard = [
-
-        ["🚕 حالة السائق"],
-
-        ["📍 مشاركة موقعي"],
-
-        ["📋 رحلاتي"],
-
-        ["👤 بياناتي"],
-
-        ["❓ المساعدة"]
-
-    ]
-
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        is_persistent=True
-    )
-
-
-def admin_menu():
-
-    keyboard = [
-
-        ["📊 إحصائيات"],
-
-        ["👨‍✈️ طلبات السائقين"],
-
-        ["🚖 الرحلات الحالية"],
-
-        ["❓ المساعدة"]
-
-    ]
-
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        is_persistent=True
-    )
-
-
-# ============================================================
-# Conversation States
-# ============================================================
-
-(
-    RIDE_PICKUP,
-    RIDE_DESTINATION,
-    RIDE_PRICE,
-
-    DRIVER_NAME,
-    DRIVER_PHONE,
-    DRIVER_CAR,
-    DRIVER_LICENSE,
-
-    RATING
-) = range(8)
-
-
-# ============================================================
-# /start
-# ============================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-
-    save_user(user)
-
-    driver = get_driver(user.id)
-
-    if driver and driver["status"] == "approved":
-
-        await update.message.reply_text(
-
-            f"أهلاً بك كابتن {driver['name']} 🚕\n\n"
-
-            f"🚖 نظام وصلني - {CITY_NAME}\n\n"
-
-            f"🚗 السيارة: {driver['car']}\n"
-            f"⭐ التقييم: {driver['rating']:.1f}\n"
-            f"🚘 الرحلات: {driver['total_rides']}\n\n"
-
-            "يمكنك الآن استقبال الرحلات القريبة منك.",
-
-            reply_markup=driver_menu()
-        )
-
-        return
-
-    await update.message.reply_text(
-
-        f"أهلاً بك في بوت وصلني 🚖\n"
-        f"لخدمات التكسي في {CITY_NAME}\n\n"
-
-        "يمكنك طلب سيارة بسهولة من القائمة.\n\n"
-
-        "🚖 طلب رحلة جديدة\n"
-        "🚕 التسجيل كسائق\n"
-        "📍 متابعة الرحلة\n"
-        "⭐ تقييم السائق",
-
-        reply_markup=passenger_menu()
-    )
-
-
-# ============================================================
-# Passenger - Start Ride
-# ============================================================
-
-async def start_ride(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    location_button = KeyboardButton(
-        "📍 مشاركة موقعي",
-        request_location=True
-    )
-
-    keyboard = [
-        [location_button],
-        ["❌ إلغاء"]
-    ]
-
-    await update.message.reply_text(
-
-        "🚖 إنشاء رحلة جديدة\n\n"
-
-        "الخطوة 1 من 3\n\n"
-
-        "📍 أرسل موقع الانطلاق.\n"
-        "يمكنك الضغط على «مشاركة موقعي» "
-        "أو كتابة العنوان.",
-
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard,
-            resize_keyboard=True,
-            one_time_keyboard=True
-        )
-    )
-
-    return RIDE_PICKUP
-
-
-async def get_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.message.text == "❌ إلغاء":
-
-        return await cancel(update, context)
-
-    if update.message.location:
-
-        location = update.message.location
-
-        context.user_data["pickup_lat"] = location.latitude
-        context.user_data["pickup_lon"] = location.longitude
-
-        context.user_data["pickup_text"] = (
-            f"موقع GPS "
-            f"({location.latitude:.6f}, "
-            f"{location.longitude:.6f})"
-        )
-
-    else:
-
-        context.user_data["pickup_text"] = update.message.text
-
-        context.user_data["pickup_lat"] = None
-        context.user_data["pickup_lon"] = None
-
-    await update.message.reply_text(
-
-        "✅ تم تحديد نقطة الانطلاق.\n\n"
-
-        "الخطوة 2 من 3\n\n"
-
-        "🏁 اكتب مكان الوصول.\n\n"
-
-        "مثال:\n"
-        "المشفى الوطني\n"
-        "ساحة البلدية\n"
-        "المنطقة الصناعية",
-
-        reply_markup=ReplyKeyboardMarkup(
-            [["❌ إلغاء"]],
-            resize_keyboard=True
-        )
-    )
-
-    return RIDE_DESTINATION
-
-
-# ============================================================
-# Destination
-# ============================================================
-
-async def get_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.message.text == "❌ إلغاء":
-
-        return await cancel(update, context)
-
-    context.user_data["destination_text"] = update.message.text
-
-    keyboard = [
-        ["15000", "20000"],
-        ["25000", "30000"],
-        ["❌ إلغاء"]
-    ]
-
-    await update.message.reply_text(
-
-        "الخطوة 3 من 3\n\n"
-
-        "💰 حدد السعر التقديري للرحلة.\n\n"
-
-        "يمكنك اختيار أحد الأسعار أو كتابة السعر بنفسك.",
-
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard,
-            resize_keyboard=True
-        )
-    )
-
-    return RIDE_PRICE
-
-
-# ============================================================
-# Create Ride
-# ============================================================
-
-async def create_ride(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.message.text == "❌ إلغاء":
-
-        return await cancel(update, context)
-
-    try:
-
-        price = int(
-            update.message.text
-            .replace(",", "")
-            .replace("ل.س", "")
-            .strip()
-        )
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "⚠️ الرجاء إدخال السعر كرقم فقط.\nمثال: 20000"
-        )
-
-        return RIDE_PRICE
-
-    user = update.effective_user
-
-    pickup_text = context.user_data.get(
-        "pickup_text",
-        "غير محدد"
-    )
-
-    destination_text = context.user_data.get(
-        "destination_text",
-        "غير محدد"
-    )
-
-    pickup_lat = context.user_data.get("pickup_lat")
-    pickup_lon = context.user_data.get("pickup_lon")
-
-    # إنشاء الرحلة
-    with db_lock:
-
-        conn = get_db()
-
-        cursor = conn.cursor()
-
-        cursor.execute("""
-        INSERT INTO rides
-        (
-            passenger_id,
-            pickup_text,
-            destination_text,
-            pickup_lat,
-            pickup_lon,
-            estimated_price,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-
-            user.id,
-            pickup_text,
-            destination_text,
-            pickup_lat,
-            pickup_lon,
-            price,
-            "searching",
-            now()
-
-        ))
-
-        ride_id = cursor.lastrowid
-
-        conn.commit()
-
-        conn.close()
-
-    # تنظيف البيانات المؤقتة
-    context.user_data.clear()
-
-    await update.message.reply_text(
-
-        f"✅ تم إنشاء طلب الرحلة رقم #{ride_id}\n\n"
-
-        f"📍 الانطلاق:\n{pickup_text}\n\n"
-
-        f"🏁 الوجهة:\n{destination_text}\n\n"
-
-        f"💰 السعر:\n{price:,} ل.س\n\n"
-
-        "🔎 جاري البحث عن أقرب كابتن...\n\n"
-
-        "سنخبرك فور قبول الرحلة.",
-
-        reply_markup=passenger_menu()
-    )
-
-    # إرسال للسائقين القريبين
-    await send_ride_to_drivers(
-        context,
-        ride_id
-    )
-
-    return ConversationHandler.END
-
-
-# ============================================================
-# Find Nearby Drivers
-# ============================================================
-
-def distance_km(lat1, lon1, lat2, lon2):
-
-    if None in (
-        lat1,
-        lon1,
-        lat2,
-        lon2
-    ):
+    if None in (lat1, lon1, lat2, lon2):
         return 999999
 
     R = 6371
@@ -666,343 +216,410 @@ def distance_km(lat1, lon1, lat2, lon2):
         * math.sin(dl / 2) ** 2
     )
 
-    return 2 * R * math.asin(math.sqrt(a))
+    return R * 2 * math.atan2(
+        math.sqrt(a),
+        math.sqrt(1 - a)
+    )
 
 
-def find_nearby_drivers(
-    latitude,
-    longitude,
-    radius_km=10
-):
+# ============================================================
+# لوحات التحكم
+# ============================================================
+
+def passenger_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("🚕 طلب سيارة")
+            ],
+            [
+                KeyboardButton("📋 طلباتي"),
+                KeyboardButton("❓ المساعدة")
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+
+def driver_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("🟢 تشغيل"),
+                KeyboardButton("🔴 إيقاف")
+            ],
+            [
+                KeyboardButton(
+                    "📍 مشاركة موقعي",
+                    request_location=True
+                )
+            ],
+            [
+                KeyboardButton("🚕 الرحلة الحالية")
+            ],
+            [
+                KeyboardButton("📊 إحصائياتي")
+            ],
+            [
+                KeyboardButton("❓ المساعدة")
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+
+def main_keyboard():
+
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton("🚕 راكب"),
+                KeyboardButton("🚗 سائق")
+            ],
+            [
+                KeyboardButton("❓ المساعدة")
+            ]
+        ],
+        resize_keyboard=True
+    )
+
+
+# ============================================================
+# /start
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    save_user(user)
+
+    text = f"""
+🚕 أهلاً بك في بوت وصلني
+
+📍 المنطقة: {CITY_NAME}
+
+اختر طريقة استخدام البوت:
+"""
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard()
+    )
+
+
+# ============================================================
+# اختيار راكب
+# ============================================================
+
+async def passenger_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        "🚕 قائمة الراكب",
+        reply_markup=passenger_keyboard()
+    )
+
+
+# ============================================================
+# اختيار سائق
+# ============================================================
+
+async def driver_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user_id = update.effective_user.id
 
     conn = get_db()
 
-    drivers = conn.execute("""
-    SELECT *
-    FROM drivers
-    WHERE status='approved'
-    AND online=1
-    AND latitude IS NOT NULL
-    AND longitude IS NOT NULL
-    """).fetchall()
+    driver = conn.execute(
+        "SELECT * FROM drivers WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
 
     conn.close()
 
-    result = []
+    if not driver:
 
-    for driver in drivers:
-
-        distance = distance_km(
-            latitude,
-            longitude,
-            driver["latitude"],
-            driver["longitude"]
+        await update.message.reply_text(
+            "🚗 أنت غير مسجل كسائق.\n\n"
+            "اضغط /register_driver للتسجيل."
         )
 
-        if distance <= radius_km:
-
-            result.append(
-                (
-                    driver,
-                    distance
-                )
-            )
-
-    result.sort(
-        key=lambda x: x[1]
-    )
-
-    return result[:10]
-
-
-# ============================================================
-# Send Ride To Drivers
-# ============================================================
-
-async def send_ride_to_drivers(
-    context,
-    ride_id
-):
-
-    ride = get_ride(ride_id)
-
-    if not ride:
         return
 
-    drivers = find_nearby_drivers(
-        ride["pickup_lat"],
-        ride["pickup_lon"]
-    )
+    if driver["status"] == "pending":
 
-    # إذا لم يكن لدى الراكب GPS
-    if ride["pickup_lat"] is None:
-
-        conn = get_db()
-
-        drivers_rows = conn.execute("""
-        SELECT *
-        FROM drivers
-        WHERE status='approved'
-        AND online=1
-        LIMIT 10
-        """).fetchall()
-
-        conn.close()
-
-        drivers = [
-            (driver, 0)
-            for driver in drivers_rows
-        ]
-
-    for driver, distance in drivers:
-
-        keyboard = InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "✅ قبول الرحلة",
-                    callback_data=f"accept_{ride_id}"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "❌ تجاهل",
-                    callback_data=f"ignore_{ride_id}"
-                )
-            ]
-
-        ])
-
-        text = (
-
-            f"🔔 طلب رحلة جديد\n\n"
-
-            f"🆔 الرحلة: #{ride_id}\n\n"
-
-            f"📍 الانطلاق:\n"
-            f"{ride['pickup_text']}\n\n"
-
-            f"🏁 الوجهة:\n"
-            f"{ride['destination_text']}\n\n"
-
-            f"💰 السعر:\n"
-            f"{ride['estimated_price']:,} ل.س\n\n"
-
-            f"📏 المسافة منك:\n"
-            f"{distance:.1f} كم\n\n"
-
-            "هل تريد قبول الرحلة؟"
-
+        await update.message.reply_text(
+            "⏳ طلب تسجيلك ما زال قيد المراجعة من مالك البوت."
         )
 
-        try:
+        return
 
-            await context.bot.send_message(
-                chat_id=driver["telegram_id"],
-                text=text,
-                reply_markup=keyboard
-            )
+    if driver["status"] == "rejected":
 
-        except Exception as e:
+        await update.message.reply_text(
+            "❌ تم رفض طلب تسجيلك."
+        )
 
-            logger.error(
-                f"Driver notification error: {e}"
-            )
+        return
+
+    await update.message.reply_text(
+        "🚗 لوحة السائق",
+        reply_markup=driver_keyboard()
+    )
 
 
 # ============================================================
-# Driver Registration
+# تسجيل السائق
 # ============================================================
 
-async def start_driver_registration(
+DRIVER_NAME = 1
+DRIVER_PHONE = 2
+DRIVER_CAR = 3
+DRIVER_LICENSE = 4
+
+
+async def register_driver_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    existing = get_driver(
-        update.effective_user.id
-    )
+    user_id = update.effective_user.id
 
-    if existing:
+    conn = get_db()
 
-        await update.message.reply_text(
+    driver = conn.execute(
+        "SELECT status FROM drivers WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
 
-            f"لديك طلب تسجيل موجود مسبقاً.\n\n"
-            f"الحالة: {existing['status']}",
+    conn.close()
 
-            reply_markup=passenger_menu()
-        )
+    if driver:
 
-        return ConversationHandler.END
+        if driver["status"] == "approved":
+            await update.message.reply_text(
+                "✅ أنت مسجل ومعتمد كسائق بالفعل."
+            )
+            return ConversationHandler.END
+
+        if driver["status"] == "pending":
+            await update.message.reply_text(
+                "⏳ طلب تسجيلك قيد المراجعة."
+            )
+            return ConversationHandler.END
 
     await update.message.reply_text(
-
-        "🚕 تسجيل كابتن جديد\n\n"
-
-        "الخطوة 1 من 4\n\n"
-
-        "👤 اكتب اسمك الكامل:",
-
-        reply_markup=ReplyKeyboardMarkup(
-            [["❌ إلغاء"]],
-            resize_keyboard=True
-        )
+        "🚗 تسجيل سائق جديد\n\n"
+        "أرسل اسمك الكامل:"
     )
 
     return DRIVER_NAME
 
 
-async def driver_name(update, context):
-
-    if update.message.text == "❌ إلغاء":
-
-        return await cancel(update, context)
+async def driver_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     context.user_data["driver_name"] = update.message.text
 
     await update.message.reply_text(
-        "📞 أرسل رقم هاتفك:"
+        "📱 أرسل رقم هاتفك:"
     )
 
     return DRIVER_PHONE
 
 
-async def driver_phone(update, context):
-
-    if update.message.text == "❌ إلغاء":
-
-        return await cancel(update, context)
+async def driver_phone(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     context.user_data["driver_phone"] = update.message.text
 
     await update.message.reply_text(
-
-        "🚗 اكتب معلومات السيارة.\n\n"
-        "مثال:\n"
-        "كيا ريو - أبيض - دمشق 123456"
-
+        "🚕 أرسل نوع السيارة + الموديل + اللون:"
     )
 
     return DRIVER_CAR
 
 
-async def driver_car(update, context):
-
-    if update.message.text == "❌ إلغاء":
-
-        return await cancel(update, context)
+async def driver_car(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     context.user_data["driver_car"] = update.message.text
 
     await update.message.reply_text(
-        "🪪 أرسل رقم شهادة السواقة:"
+        "🪪 أرسل رقم إجازة/رخصة القيادة.\n\n"
+        "يمكنك أيضاً إرسال صورة الرخصة."
     )
 
     return DRIVER_LICENSE
 
 
-async def driver_license(update, context):
-
-    if update.message.text == "❌ إلغاء":
-
-        return await cancel(update, context)
+async def driver_license(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user = update.effective_user
 
-    license_number = update.message.text
+    name = context.user_data.get("driver_name", "")
+    phone = context.user_data.get("driver_phone", "")
+    car = context.user_data.get("driver_car", "")
 
-    name = context.user_data["driver_name"]
-    phone = context.user_data["driver_phone"]
-    car = context.user_data["driver_car"]
+    license_text = ""
+    license_file_id = None
 
-    with db_lock:
+    # إذا أرسل نص
+    if update.message.text:
 
-        conn = get_db()
+        license_text = update.message.text
 
-        conn.execute("""
-        INSERT OR REPLACE INTO drivers
-        (
-            telegram_id,
+    # إذا أرسل صورة
+    elif update.message.photo:
+
+        license_text = "تم إرسال صورة الرخصة"
+
+        license_file_id = (
+            update.message.photo[-1].file_id
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "❌ الرجاء إرسال رقم الرخصة أو صورة الرخصة."
+        )
+
+        return DRIVER_LICENSE
+
+    conn = get_db()
+
+    conn.execute("""
+        INSERT INTO drivers (
+            user_id,
             name,
             phone,
             car,
             license,
+            license_file_id,
             status,
             online,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)
 
-            user.id,
-            name,
-            phone,
-            car,
-            license_number,
-            "pending",
-            0,
-            now()
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            name=excluded.name,
+            phone=excluded.phone,
+            car=excluded.car,
+            license=excluded.license,
+            license_file_id=excluded.license_file_id,
+            status='pending'
+    """, (
+        user.id,
+        name,
+        phone,
+        car,
+        license_text,
+        license_file_id,
+        now()
+    ))
 
-        ))
+    conn.commit()
+    conn.close()
 
-        conn.commit()
+    # ========================================================
+    # إرسال بيانات السائق للمالك فقط
+    # ========================================================
 
-        conn.close()
+    owner_text = f"""
+🚗 طلب تسجيل سائق جديد
 
-    await update.message.reply_text(
+👤 الاسم:
+{name}
 
-        "✅ تم إرسال طلب التسجيل.\n\n"
+📱 الهاتف:
+{phone}
 
-        "سيتم مراجعته من الإدارة.\n"
-        "بعد الموافقة سيصبح بإمكانك استقبال الرحلات.",
+🚕 السيارة:
+{car}
 
-        reply_markup=passenger_menu()
-    )
+🪪 الرخصة:
+{license_text}
 
-    # إرسال الطلب إلى الإدارة
-    keyboard = InlineKeyboardMarkup([
+🆔 Telegram ID:
+{user.id}
 
+📅 التاريخ:
+{now()}
+
+⚠️ الحالة:
+بانتظار موافقة المالك
+"""
+
+    keyboard = InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "✅ اعتماد",
-                callback_data=f"approve_{user.id}"
-            ),
-
-            InlineKeyboardButton(
-                "❌ رفض",
-                callback_data=f"reject_{user.id}"
-            )
+            [
+                InlineKeyboardButton(
+                    "✅ قبول السائق",
+                    callback_data=f"approve_driver_{user.id}"
+                ),
+                InlineKeyboardButton(
+                    "❌ رفض",
+                    callback_data=f"reject_driver_{user.id}"
+                )
+            ]
         ]
-
-    ])
-
-    admin_text = (
-
-        "🚕 طلب سائق جديد\n\n"
-
-        f"👤 الاسم: {name}\n"
-        f"📞 الهاتف: {phone}\n"
-        f"🚗 السيارة: {car}\n"
-        f"🪪 الرخصة: {license_number}\n"
-        f"🆔 Telegram ID: {user.id}\n"
-        f"@{user.username or 'بدون_معرف'}"
-
     )
 
-    for admin_id in ADMIN_IDS:
+    if OWNER_ID == 0:
+
+        logger.error(
+            "OWNER_ID غير مضبوط في متغيرات البيئة"
+        )
+
+    else:
 
         try:
 
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=admin_text,
-                reply_markup=keyboard
+            # إذا توجد صورة للرخصة نرسلها للمالك أولاً
+            if license_file_id:
+
+                await context.bot.send_photo(
+                    chat_id=OWNER_ID,
+                    photo=license_file_id,
+                    caption=owner_text,
+                    reply_markup=keyboard
+                )
+
+            else:
+
+                await context.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=owner_text,
+                    reply_markup=keyboard
+                )
+
+            logger.info(
+                f"تم إرسال طلب السائق {user.id} إلى المالك فقط"
             )
 
         except Exception as e:
 
-            logger.error(e)
+            logger.error(
+                f"خطأ في إرسال طلب السائق للمالك: {e}"
+            )
+
+    await update.message.reply_text(
+        "✅ تم إرسال بياناتك إلى مالك البوت للمراجعة.\n\n"
+        "⏳ سيتم إعلامك بعد اتخاذ قرار القبول أو الرفض."
+    )
 
     context.user_data.clear()
 
@@ -1010,7 +627,7 @@ async def driver_license(update, context):
 
 
 # ============================================================
-# Admin Driver Approval
+# قبول / رفض السائق
 # ============================================================
 
 async def driver_approval(
@@ -1022,163 +639,198 @@ async def driver_approval(
 
     await query.answer()
 
-    if query.from_user.id not in ADMIN_IDS:
+    # ========================================================
+    # المالك فقط
+    # ========================================================
+
+    if update.effective_user.id != OWNER_ID:
 
         await query.answer(
-            "غير مصرح لك.",
+            "⛔ هذا الإجراء متاح لمالك البوت فقط.",
             show_alert=True
         )
 
         return
 
-    action, user_id_text = query.data.split("_")
+    data = query.data
 
-    driver_id = int(user_id_text)
+    if data.startswith("approve_driver_"):
 
-    driver = get_driver(driver_id)
-
-    if not driver:
-
-        await query.edit_message_text(
-            "❌ لم يتم العثور على السائق."
+        driver_id = int(
+            data.replace(
+                "approve_driver_",
+                ""
+            )
         )
 
-        return
+        conn = get_db()
 
-    if action == "approve":
-
-        with db_lock:
-
-            conn = get_db()
-
-            conn.execute("""
+        conn.execute("""
             UPDATE drivers
-            SET status='approved'
-            WHERE telegram_id=?
-            """, (driver_id,))
+            SET status='approved',
+                approved_at=?
+            WHERE user_id=?
+        """, (
+            now(),
+            driver_id
+        ))
 
-            conn.commit()
-
-            conn.close()
+        conn.commit()
+        conn.close()
 
         await query.edit_message_text(
-
-            "✅ تم اعتماد السائق.\n\n"
-
-            f"👤 {driver['name']}\n"
-            f"🚗 {driver['car']}"
-
+            "✅ تم قبول السائق بنجاح."
         )
 
-        await context.bot.send_message(
+        try:
 
-            chat_id=driver_id,
+            await context.bot.send_message(
+                chat_id=driver_id,
+                text=(
+                    "🎉 مبروك!\n\n"
+                    "✅ تمت الموافقة على تسجيلك كسائق "
+                    "في بوت وصلني.\n\n"
+                    "يمكنك الآن الدخول إلى قائمة السائق."
+                ),
+                reply_markup=driver_keyboard()
+            )
 
-            text=(
+        except Exception as e:
 
-                f"🎉 أهلاً بك كابتن {driver['name']}!\n\n"
+            logger.error(
+                f"خطأ في إرسال رسالة القبول: {e}"
+            )
 
-                "تم اعتماد حسابك كسائق في وصلني 🚕\n\n"
+    elif data.startswith("reject_driver_"):
 
-                "يمكنك الآن تشغيل حالة السائق "
-                "واستقبال الرحلات."
-
-            ),
-
-            reply_markup=driver_menu()
+        driver_id = int(
+            data.replace(
+                "reject_driver_",
+                ""
+            )
         )
 
-    else:
+        conn = get_db()
 
-        with db_lock:
-
-            conn = get_db()
-
-            conn.execute("""
+        conn.execute("""
             UPDATE drivers
-            SET status='rejected'
-            WHERE telegram_id=?
-            """, (driver_id,))
+            SET status='rejected',
+                online=0
+            WHERE user_id=?
+        """, (
+            driver_id,
+        ))
 
-            conn.commit()
-
-            conn.close()
+        conn.commit()
+        conn.close()
 
         await query.edit_message_text(
-            f"❌ تم رفض طلب {driver['name']}."
+            "❌ تم رفض طلب السائق."
         )
 
-        await context.bot.send_message(
+        try:
 
-            chat_id=driver_id,
+            await context.bot.send_message(
+                chat_id=driver_id,
+                text=(
+                    "❌ نأسف، تم رفض طلب تسجيلك كسائق "
+                    "في بوت وصلني."
+                )
+            )
 
-            text="❌ تم رفض طلب التسجيل كسائق."
-        )
+        except Exception as e:
+
+            logger.error(
+                f"خطأ في إرسال رسالة الرفض: {e}"
+            )
 
 
 # ============================================================
-# Driver Online / Offline
+# تشغيل السائق
 # ============================================================
 
-async def driver_status(
+async def driver_online(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     user_id = update.effective_user.id
 
-    driver = get_driver(user_id)
+    conn = get_db()
 
-    if not driver or driver["status"] != "approved":
+    driver = conn.execute(
+        "SELECT status FROM drivers WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+
+    if not driver:
+
+        conn.close()
 
         await update.message.reply_text(
-            "⚠️ أنت لست سائقاً معتمداً."
+            "❌ أنت غير مسجل كسائق."
         )
 
         return
 
-    current = driver["online"]
-
-    new_status = 0 if current else 1
-
-    with db_lock:
-
-        conn = get_db()
-
-        conn.execute("""
-        UPDATE drivers
-        SET online=?
-        WHERE telegram_id=?
-        """, (
-            new_status,
-            user_id
-        ))
-
-        conn.commit()
+    if driver["status"] != "approved":
 
         conn.close()
 
-    if new_status:
-
-        text = (
-            "🟢 أصبحت متاحاً الآن.\n\n"
-            "ستصلك طلبات الرحلات."
+        await update.message.reply_text(
+            "⏳ حسابك لم تتم الموافقة عليه بعد."
         )
 
-    else:
+        return
 
-        text = (
-            "🔴 تم إيقاف استقبال الرحلات."
-        )
+    conn.execute("""
+        UPDATE drivers
+        SET online=1
+        WHERE user_id=?
+    """, (
+        user_id,
+    ))
+
+    conn.commit()
+    conn.close()
 
     await update.message.reply_text(
-        text,
-        reply_markup=driver_menu()
+        "🟢 تم تشغيل حالة السائق.\n\n"
+        "ستصلك طلبات الرحلات."
     )
 
 
 # ============================================================
-# Driver Location
+# إيقاف السائق
+# ============================================================
+
+async def driver_offline(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    conn = get_db()
+
+    conn.execute("""
+        UPDATE drivers
+        SET online=0
+        WHERE user_id=?
+    """, (
+        user_id,
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        "🔴 تم إيقاف حالة السائق."
+    )
+
+
+# ============================================================
+# مشاركة موقع السائق
 # ============================================================
 
 async def driver_location(
@@ -1188,55 +840,317 @@ async def driver_location(
 
     user_id = update.effective_user.id
 
-    driver = get_driver(user_id)
-
-    if not driver or driver["status"] != "approved":
-
-        await update.message.reply_text(
-            "⚠️ هذه الخاصية للسائقين المعتمدين فقط."
-        )
-
-        return
-
     if not update.message.location:
-
         return
 
-    location = update.message.location
+    lat = update.message.location.latitude
+    lon = update.message.location.longitude
 
-    with db_lock:
+    conn = get_db()
 
-        conn = get_db()
-
-        conn.execute("""
+    conn.execute("""
         UPDATE drivers
-        SET latitude=?,
-            longitude=?,
-            online=1
-        WHERE telegram_id=?
-        """, (
+        SET lat=?,
+            lon=?
+        WHERE user_id=?
+    """, (
+        lat,
+        lon,
+        user_id
+    ))
 
-            location.latitude,
-            location.longitude,
-            user_id
-
-        ))
-
-        conn.commit()
-
-        conn.close()
+    conn.commit()
+    conn.close()
 
     await update.message.reply_text(
-
-        "📍 تم تحديث موقعك.\n"
-        "🟢 أنت الآن متاح لاستقبال الرحلات.",
-
-        reply_markup=driver_menu()
+        "📍 تم تحديث موقعك بنجاح."
     )
 
 
 # ============================================================
-# Accept Ride
+# طلب سيارة - البداية
+# ============================================================
+
+RIDE_PICKUP = 10
+RIDE_DESTINATION = 11
+RIDE_PRICE = 12
+
+
+async def ride_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "🚕 طلب سيارة\n\n"
+        "📍 أرسل موقع الانطلاق من خلال زر الموقع، "
+        "أو اكتب مكان الانطلاق:"
+    )
+
+    return RIDE_PICKUP
+
+
+# ============================================================
+# موقع الانطلاق
+# ============================================================
+
+async def ride_pickup(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if update.message.location:
+
+        location = update.message.location
+
+        context.user_data["pickup_lat"] = (
+            location.latitude
+        )
+
+        context.user_data["pickup_lon"] = (
+            location.longitude
+        )
+
+        context.user_data["pickup"] = (
+            f"الموقع الجغرافي: "
+            f"{location.latitude:.6f}, "
+            f"{location.longitude:.6f}"
+        )
+
+    else:
+
+        context.user_data["pickup"] = (
+            update.message.text
+        )
+
+        context.user_data["pickup_lat"] = None
+        context.user_data["pickup_lon"] = None
+
+    await update.message.reply_text(
+        "📍 أرسل مكان الوصول:"
+    )
+
+    return RIDE_DESTINATION
+
+
+# ============================================================
+# الوجهة
+# ============================================================
+
+async def ride_destination(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    context.user_data["destination"] = (
+        update.message.text
+    )
+
+    await update.message.reply_text(
+        "💰 أرسل أجرة الرحلة:"
+    )
+
+    return RIDE_PRICE
+
+
+# ============================================================
+# السعر وإنشاء الرحلة
+# ============================================================
+
+async def ride_price(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    try:
+
+        price = float(
+            update.message.text.replace(",", ".")
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ الرجاء إرسال السعر كرقم.\n"
+            "مثال: 50000"
+        )
+
+        return RIDE_PRICE
+
+    user_id = update.effective_user.id
+
+    pickup = context.user_data.get(
+        "pickup",
+        ""
+    )
+
+    destination = context.user_data.get(
+        "destination",
+        ""
+    )
+
+    pickup_lat = context.user_data.get(
+        "pickup_lat"
+    )
+
+    pickup_lon = context.user_data.get(
+        "pickup_lon"
+    )
+
+    conn = get_db()
+
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO rides (
+            passenger_id,
+            pickup,
+            destination,
+            pickup_lat,
+            pickup_lon,
+            price,
+            status,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'searching', ?)
+    """, (
+        user_id,
+        pickup,
+        destination,
+        pickup_lat,
+        pickup_lon,
+        price,
+        now()
+    ))
+
+    ride_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    # ========================================================
+    # البحث عن السائقين
+    # ========================================================
+
+    conn = get_db()
+
+    drivers = conn.execute("""
+        SELECT *
+        FROM drivers
+        WHERE status='approved'
+          AND online=1
+    """).fetchall()
+
+    conn.close()
+
+    available_drivers = []
+
+    for driver in drivers:
+
+        distance = haversine(
+            pickup_lat,
+            pickup_lon,
+            driver["lat"],
+            driver["lon"]
+        )
+
+        available_drivers.append(
+            (
+                distance,
+                driver
+            )
+        )
+
+    available_drivers.sort(
+        key=lambda x: x[0]
+    )
+
+    # إرسال الطلب إلى أقرب 10 سائقين
+    sent_count = 0
+
+    ride_text = f"""
+🚕 طلب رحلة جديدة
+
+🆔 رقم الرحلة:
+#{ride_id}
+
+📍 الانطلاق:
+{pickup}
+
+🏁 الوجهة:
+{destination}
+
+💰 الأجرة:
+{price:,.0f}
+
+📏 المسافة عنك:
+سيتم عرضها حسب موقعك
+
+⚠️ أول سائق يقبل الرحلة يحصل عليها.
+"""
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🚕 قبول الرحلة",
+                    callback_data=f"accept_ride_{ride_id}"
+                )
+            ]
+        ]
+    )
+
+    for distance, driver in available_drivers:
+
+        if sent_count >= 10:
+            break
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=driver["user_id"],
+                text=ride_text,
+                reply_markup=keyboard
+            )
+
+            sent_count += 1
+
+        except Exception as e:
+
+            logger.error(
+                f"خطأ بإرسال الرحلة للسائق "
+                f"{driver['user_id']}: {e}"
+            )
+
+    await update.message.reply_text(
+        f"""
+✅ تم إنشاء طلب الرحلة
+
+🆔 رقم الطلب: #{ride_id}
+
+📍 من:
+{pickup}
+
+🏁 إلى:
+{destination}
+
+💰 الأجرة:
+{price:,.0f}
+
+🚕 تم البحث عن سائقين قريبين.
+
+عدد السائقين الذين وصلهم الطلب:
+{sent_count}
+"""
+    )
+
+    context.user_data.clear()
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# قبول الرحلة
 # ============================================================
 
 async def accept_ride(
@@ -1248,161 +1162,277 @@ async def accept_ride(
 
     await query.answer()
 
-    driver_user = query.from_user
+    driver_id = update.effective_user.id
 
-    driver = get_driver(
-        driver_user.id
+    data = query.data
+
+    ride_id = int(
+        data.replace(
+            "accept_ride_",
+            ""
+        )
     )
 
-    if not driver or driver["status"] != "approved":
+    conn = get_db()
+
+    driver = conn.execute("""
+        SELECT *
+        FROM drivers
+        WHERE user_id=?
+          AND status='approved'
+    """, (
+        driver_id,
+    )).fetchone()
+
+    if not driver:
+
+        conn.close()
 
         await query.answer(
-            "⚠️ يجب أن تكون سائقاً معتمداً.",
+            "❌ أنت لست سائقاً معتمداً.",
             show_alert=True
         )
 
         return
 
-    ride_id = int(
-        query.data.split("_")[1]
-    )
+    # ========================================================
+    # قبول ذري للرحلة
+    # ========================================================
 
-    # عملية ذرية لمنع قبول الرحلة من سائقين
-    with db_lock:
+    cur = conn.cursor()
 
-        conn = get_db()
-
-        cursor = conn.cursor()
-
-        cursor.execute("""
+    cur.execute("""
         UPDATE rides
-
-        SET
-            status='accepted',
+        SET status='accepted',
             driver_id=?,
             accepted_at=?
-
         WHERE id=?
-        AND status='searching'
-        """, (
+          AND status='searching'
+    """, (
+        driver_id,
+        now(),
+        ride_id
+    ))
 
-            driver_user.id,
-            now(),
-            ride_id
-
-        ))
-
-        updated = cursor.rowcount
-
-        conn.commit()
+    if cur.rowcount == 0:
 
         conn.close()
 
-    if updated == 0:
-
-        await query.edit_message_text(
-
-            "⚠️ هذه الرحلة لم تعد متاحة.\n"
-            "تم قبولها من سائق آخر."
-
+        await query.answer(
+            "❌ الرحلة تم قبولها من سائق آخر.",
+            show_alert=True
         )
+
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
 
         return
 
-    # السائق يصبح مشغولاً
-    with db_lock:
-
-        conn = get_db()
-
-        conn.execute("""
+    # ربط الرحلة بالسائق
+    conn.execute("""
         UPDATE drivers
-        SET online=0
-        WHERE telegram_id=?
-        """, (driver_user.id,))
+        SET current_ride=?
+        WHERE user_id=?
+    """, (
+        ride_id,
+        driver_id
+    ))
 
-        conn.commit()
+    ride = conn.execute("""
+        SELECT *
+        FROM rides
+        WHERE id=?
+    """, (
+        ride_id,
+    )).fetchone()
 
-        conn.close()
-
-    ride = get_ride(ride_id)
+    conn.commit()
+    conn.close()
 
     await query.edit_message_text(
+        f"""
+✅ تم قبول الرحلة
 
-        f"✅ تم قبول الرحلة #{ride_id}\n\n"
+🆔 الرحلة: #{ride_id}
 
-        f"📍 الانطلاق:\n"
-        f"{ride['pickup_text']}\n\n"
+📍 الانطلاق:
+{ride['pickup']}
 
-        f"🏁 الوجهة:\n"
-        f"{ride['destination_text']}\n\n"
+🏁 الوجهة:
+{ride['destination']}
 
-        f"💰 السعر:\n"
-        f"{ride['estimated_price']:,} ل.س\n\n"
-
-        "🚖 توجه إلى الراكب."
-
+💰 الأجرة:
+{ride['price']:,.0f}
+"""
     )
 
-    # إرسال للراكب
+    # ========================================================
+    # إرسال بيانات السائق للراكب
+    # ========================================================
+
+    conn = get_db()
+
+    driver_info = conn.execute("""
+        SELECT *
+        FROM drivers
+        WHERE user_id=?
+    """, (
+        driver_id,
+    )).fetchone()
+
+    conn.close()
+
+    passenger_text = f"""
+🚕 تم العثور على سائق!
+
+👤 السائق:
+{driver_info['name']}
+
+🚗 السيارة:
+{driver_info['car']}
+
+📱 الهاتف:
+{driver_info['phone']}
+
+🆔 رقم الرحلة:
+#{ride_id}
+
+📍 السائق في طريقه إليك.
+"""
+
     try:
 
         await context.bot.send_message(
-
             chat_id=ride["passenger_id"],
-
-            text=(
-
-                "🎉 تم العثور على كابتن!\n\n"
-
-                f"👤 السائق: {driver['name']}\n"
-                f"🚗 السيارة: {driver['car']}\n"
-                f"⭐ التقييم: {driver['rating']:.1f}\n"
-                f"📞 الهاتف: {driver['phone']}\n\n"
-
-                f"💰 السعر: "
-                f"{ride['estimated_price']:,} ل.س\n\n"
-
-                "🚖 السائق في طريقه إليك."
-
-            )
-
+            text=passenger_text
         )
 
     except Exception as e:
 
-        logger.error(e)
+        logger.error(
+            f"خطأ بإبلاغ الراكب: {e}"
+        )
 
 
 # ============================================================
-# Ignore Ride
+# الرحلة الحالية للسائق
 # ============================================================
 
-async def ignore_ride(
+async def current_ride(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    query = update.callback_query
+    driver_id = update.effective_user.id
 
-    await query.answer(
-        "تم تجاهل الطلب."
-    )
+    conn = get_db()
 
-    try:
+    ride = conn.execute("""
+        SELECT r.*
+        FROM rides r
+        JOIN drivers d
+          ON d.current_ride = r.id
+        WHERE d.user_id=?
+          AND r.status='accepted'
+    """, (
+        driver_id,
+    )).fetchone()
 
-        await query.edit_message_reply_markup(
-            reply_markup=None
+    conn.close()
+
+    if not ride:
+
+        await update.message.reply_text(
+            "📭 لا توجد لديك رحلة حالياً."
         )
 
-    except Exception:
-        pass
+        return
+
+    await update.message.reply_text(
+        f"""
+🚕 رحلتك الحالية
+
+🆔 رقم الرحلة:
+#{ride['id']}
+
+📍 الانطلاق:
+{ride['pickup']}
+
+🏁 الوجهة:
+{ride['destination']}
+
+💰 الأجرة:
+{ride['price']:,.0f}
+"""
+    )
 
 
 # ============================================================
-# Current Ride
+# إحصائيات السائق
 # ============================================================
 
-async def current_ride(
+async def driver_statistics(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    driver_id = update.effective_user.id
+
+    conn = get_db()
+
+    total = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM rides
+        WHERE driver_id=?
+    """, (
+        driver_id,
+    )).fetchone()["count"]
+
+    completed = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM rides
+        WHERE driver_id=?
+          AND status='completed'
+    """, (
+        driver_id,
+    )).fetchone()["count"]
+
+    earnings = conn.execute("""
+        SELECT COALESCE(SUM(price), 0) AS total
+        FROM rides
+        WHERE driver_id=?
+          AND status='completed'
+    """, (
+        driver_id,
+    )).fetchone()["total"]
+
+    conn.close()
+
+    await update.message.reply_text(
+        f"""
+📊 إحصائياتك
+
+🚕 إجمالي الرحلات:
+{total}
+
+✅ الرحلات المكتملة:
+{completed}
+
+💰 إجمالي الأرباح:
+{earnings:,.0f}
+"""
+    )
+
+
+# ============================================================
+# طلبات الراكب
+# ============================================================
+
+async def passenger_rides(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1411,176 +1441,138 @@ async def current_ride(
 
     conn = get_db()
 
-    ride = conn.execute("""
-    SELECT *
-    FROM rides
-    WHERE passenger_id=?
-    AND status IN (
-        'searching',
-        'accepted',
-        'started'
-    )
-    ORDER BY id DESC
-    LIMIT 1
-    """, (user_id,)).fetchone()
+    rides = conn.execute("""
+        SELECT *
+        FROM rides
+        WHERE passenger_id=?
+        ORDER BY id DESC
+        LIMIT 10
+    """, (
+        user_id,
+    )).fetchall()
 
     conn.close()
 
-    if not ride:
+    if not rides:
 
         await update.message.reply_text(
-            "لا توجد لديك رحلة حالية."
+            "📭 لا توجد لديك طلبات سابقة."
         )
 
         return
 
-    status_names = {
+    text = "📋 آخر طلباتك:\n\n"
 
-        "searching": "🔎 جاري البحث عن سائق",
+    for ride in rides:
 
-        "accepted": "🚕 تم قبول الرحلة",
-
-        "started": "🚖 الرحلة جارية"
-
-    }
-
-    text = (
-
-        f"🚖 رحلتك #{ride['id']}\n\n"
-
-        f"📍 الانطلاق:\n"
-        f"{ride['pickup_text']}\n\n"
-
-        f"🏁 الوجهة:\n"
-        f"{ride['destination_text']}\n\n"
-
-        f"💰 السعر:\n"
-        f"{ride['estimated_price']:,} ل.س\n\n"
-
-        f"الحالة:\n"
-        f"{status_names.get(ride['status'], ride['status'])}"
-
-    )
-
-    if ride["driver_id"]:
-
-        driver = get_driver(
-            ride["driver_id"]
+        text += (
+            f"🆔 #{ride['id']}\n"
+            f"📍 {ride['pickup']}\n"
+            f"🏁 {ride['destination']}\n"
+            f"💰 {ride['price']:,.0f}\n"
+            f"📌 الحالة: {ride['status']}\n\n"
         )
 
-        if driver:
-
-            text += (
-
-                "\n\n🚕 بيانات الكابتن\n\n"
-
-                f"👤 {driver['name']}\n"
-                f"🚗 {driver['car']}\n"
-                f"📞 {driver['phone']}\n"
-                f"⭐ {driver['rating']:.1f}"
-
-            )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=passenger_menu()
-    )
+    await update.message.reply_text(text)
 
 
 # ============================================================
-# Driver Info
+# إحصائيات المالك
 # ============================================================
 
-async def driver_info(
+async def owner_statistics(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    driver = get_driver(
-        update.effective_user.id
-    )
-
-    if not driver:
+    if update.effective_user.id != OWNER_ID:
 
         await update.message.reply_text(
-            "أنت غير مسجل كسائق."
+            "⛔ هذا الأمر متاح لمالك البوت فقط."
         )
-
-        return
-
-    await update.message.reply_text(
-
-        "👤 بيانات الكابتن\n\n"
-
-        f"الاسم: {driver['name']}\n"
-        f"الهاتف: {driver['phone']}\n"
-        f"السيارة: {driver['car']}\n"
-        f"الرخصة: {driver['license']}\n\n"
-
-        f"الحالة: {driver['status']}\n"
-        f"متاح: {'🟢 نعم' if driver['online'] else '🔴 لا'}\n"
-        f"⭐ التقييم: {driver['rating']:.1f}\n"
-        f"🚖 الرحلات: {driver['total_rides']}",
-
-        reply_markup=driver_menu()
-    )
-
-
-# ============================================================
-# Admin Statistics
-# ============================================================
-
-async def statistics(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_user.id not in ADMIN_IDS:
 
         return
 
     conn = get_db()
 
     users = conn.execute(
-        "SELECT COUNT(*) FROM users"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS count FROM users"
+    ).fetchone()["count"]
 
     drivers = conn.execute(
-        "SELECT COUNT(*) FROM drivers WHERE status='approved'"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS count FROM drivers"
+    ).fetchone()["count"]
 
-    online = conn.execute(
-        "SELECT COUNT(*) FROM drivers WHERE status='approved' AND online=1"
-    ).fetchone()[0]
+    approved = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM drivers
+        WHERE status='approved'
+    """).fetchone()["count"]
+
+    pending = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM drivers
+        WHERE status='pending'
+    """).fetchone()["count"]
+
+    online = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM drivers
+        WHERE status='approved'
+          AND online=1
+    """).fetchone()["count"]
 
     rides = conn.execute(
-        "SELECT COUNT(*) FROM rides"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS count FROM rides"
+    ).fetchone()["count"]
 
-    active = conn.execute("""
-    SELECT COUNT(*)
-    FROM rides
-    WHERE status IN ('searching','accepted','started')
-    """).fetchone()[0]
+    searching = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM rides
+        WHERE status='searching'
+    """).fetchone()["count"]
+
+    accepted = conn.execute("""
+        SELECT COUNT(*) AS count
+        FROM rides
+        WHERE status='accepted'
+    """).fetchone()["count"]
 
     conn.close()
 
     await update.message.reply_text(
+        f"""
+📊 إحصائيات وصلني
 
-        f"📊 إحصائيات وصلني - {CITY_NAME}\n\n"
+👥 المستخدمون:
+{users}
 
-        f"👥 المستخدمون: {users}\n"
-        f"👨‍✈️ السائقون المعتمدون: {drivers}\n"
-        f"🟢 السائقون المتاحون: {online}\n"
-        f"🚖 إجمالي الرحلات: {rides}\n"
-        f"🔵 الرحلات الحالية: {active}",
+🚗 السائقون:
+{drivers}
 
-        reply_markup=admin_menu()
+✅ السائقون المعتمدون:
+{approved}
+
+⏳ طلبات السائقين قيد المراجعة:
+{pending}
+
+🟢 السائقون المتصلون:
+{online}
+
+🚕 إجمالي الرحلات:
+{rides}
+
+🔎 الرحلات الباحثة عن سائق:
+{searching}
+
+🚗 الرحلات المقبولة:
+{accepted}
+"""
     )
 
 
 # ============================================================
-# Help
+# المساعدة
 # ============================================================
 
 async def help_command(
@@ -1589,27 +1581,32 @@ async def help_command(
 ):
 
     await update.message.reply_text(
+        f"""
+❓ مساعدة - وصلني
 
-        "❓ مساعدة وصلني\n\n"
+📍 المنطقة:
+{CITY_NAME}
 
-        "🚖 للراكب:\n"
-        "اضغط «طلب رحلة جديدة» واتبع الخطوات.\n\n"
+🚕 للراكب:
+اضغط "🚕 طلب سيارة"
 
-        "🚕 للسائق:\n"
-        "سجل كسائق، وبعد اعتماد الحساب شغل حالة السائق وشارك موقعك.\n\n"
+🚗 للسائق:
+اضغط "🚗 سائق"
 
-        "📍 الموقع:\n"
-        "يستخدم الموقع لتحديد أقرب السائقين.\n\n"
+📝 تسجيل سائق:
+/register_driver
 
-        "☎️ الدعم:\n"
-        "يمكنك التواصل مع إدارة وصلني.",
+📊 إحصائيات المالك:
+/statistics
 
-        reply_markup=passenger_menu()
+/start
+إعادة تشغيل البوت
+"""
     )
 
 
 # ============================================================
-# Cancel
+# إلغاء
 # ============================================================
 
 async def cancel(
@@ -1620,57 +1617,15 @@ async def cancel(
     context.user_data.clear()
 
     await update.message.reply_text(
-
         "❌ تم إلغاء العملية.",
-
-        reply_markup=passenger_menu()
+        reply_markup=main_keyboard()
     )
 
     return ConversationHandler.END
 
 
 # ============================================================
-# Bot Commands
-# ============================================================
-
-async def post_init(application):
-
-    commands = [
-
-        BotCommand(
-            "start",
-            "القائمة الرئيسية"
-        ),
-
-        BotCommand(
-            "ride",
-            "طلب رحلة"
-        ),
-
-        BotCommand(
-            "register_driver",
-            "التسجيل كسائق"
-        ),
-
-        BotCommand(
-            "help",
-            "المساعدة"
-        ),
-
-        BotCommand(
-            "cancel",
-            "إلغاء"
-        )
-
-    ]
-
-    await application.bot.set_my_commands(
-        commands
-    )
-
-
-# ============================================================
-# Main
+# تشغيل البوت
 # ============================================================
 
 def main():
@@ -1678,184 +1633,129 @@ def main():
     if not BOT_TOKEN:
 
         raise RuntimeError(
-            "BOT_TOKEN غير موجود في متغيرات البيئة."
+            "BOT_TOKEN غير موجود في Environment Variables"
+        )
+
+    if OWNER_ID == 0:
+
+        logger.warning(
+            "⚠️ OWNER_ID غير مضبوط!"
         )
 
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
 
-    # --------------------------------------------------------
-    # Passenger Ride Conversation
-    # --------------------------------------------------------
+    # ========================================================
+    # تسجيل السائق
+    # ========================================================
 
-    ride_handler = ConversationHandler(
-
-        entry_points=[
-
-            CommandHandler(
-                "ride",
-                start_ride
-            ),
-
-            MessageHandler(
-                filters.Regex(
-                    "^🚖 طلب رحلة جديدة$"
-                ),
-                start_ride
-            )
-
-        ],
-
-        states={
-
-            RIDE_PICKUP: [
-
-                MessageHandler(
-                    filters.LOCATION |
-                    (
-                        filters.TEXT &
-                        ~filters.COMMAND
-                    ),
-                    get_pickup
-                )
-
-            ],
-
-            RIDE_DESTINATION: [
-
-                MessageHandler(
-                    filters.TEXT &
-                    ~filters.COMMAND,
-                    get_destination
-                )
-
-            ],
-
-            RIDE_PRICE: [
-
-                MessageHandler(
-                    filters.TEXT &
-                    ~filters.COMMAND,
-                    create_ride
-                )
-
-            ]
-
-        },
-
-        fallbacks=[
-
-            CommandHandler(
-                "cancel",
-                cancel
-            ),
-
-            MessageHandler(
-                filters.Regex("^❌ إلغاء$"),
-                cancel
-            )
-
-        ]
-
-    )
-
-    # --------------------------------------------------------
-    # Driver Registration
-    # --------------------------------------------------------
-
-    driver_handler = ConversationHandler(
+    driver_registration = ConversationHandler(
 
         entry_points=[
-
             CommandHandler(
                 "register_driver",
-                start_driver_registration
-            ),
-
-            MessageHandler(
-                filters.Regex(
-                    "^🚕 التسجيل كسائق$"
-                ),
-                start_driver_registration
+                register_driver_start
             )
-
         ],
 
         states={
 
             DRIVER_NAME: [
-
                 MessageHandler(
-                    filters.TEXT &
-                    ~filters.COMMAND,
+                    filters.TEXT & ~filters.COMMAND,
                     driver_name
                 )
-
             ],
 
             DRIVER_PHONE: [
-
                 MessageHandler(
-                    filters.TEXT &
-                    ~filters.COMMAND,
+                    filters.TEXT & ~filters.COMMAND,
                     driver_phone
                 )
-
             ],
 
             DRIVER_CAR: [
-
                 MessageHandler(
-                    filters.TEXT &
-                    ~filters.COMMAND,
+                    filters.TEXT & ~filters.COMMAND,
                     driver_car
                 )
-
             ],
 
             DRIVER_LICENSE: [
-
                 MessageHandler(
-                    filters.TEXT &
-                    ~filters.COMMAND,
+                    (
+                        filters.TEXT
+                        | filters.PHOTO
+                    )
+                    & ~filters.COMMAND,
                     driver_license
                 )
-
             ]
-
         },
 
         fallbacks=[
-
             CommandHandler(
                 "cancel",
                 cancel
-            ),
+            )
+        ]
+    )
 
+    # ========================================================
+    # طلب الرحلة
+    # ========================================================
+
+    ride_conversation = ConversationHandler(
+
+        entry_points=[
             MessageHandler(
-                filters.Regex("^❌ إلغاء$"),
+                filters.Regex("^🚕 طلب سيارة$"),
+                ride_start
+            )
+        ],
+
+        states={
+
+            RIDE_PICKUP: [
+                MessageHandler(
+                    filters.LOCATION,
+                    ride_pickup
+                ),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    ride_pickup
+                )
+            ],
+
+            RIDE_DESTINATION: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    ride_destination
+                )
+            ],
+
+            RIDE_PRICE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    ride_price
+                )
+            ]
+        },
+
+        fallbacks=[
+            CommandHandler(
+                "cancel",
                 cancel
             )
-
         ]
-
     )
 
-    # --------------------------------------------------------
-    # Add handlers
-    # --------------------------------------------------------
-
-    application.add_handler(
-        ride_handler
-    )
-
-    application.add_handler(
-        driver_handler
-    )
+    # ========================================================
+    # الأوامر
+    # ========================================================
 
     application.add_handler(
         CommandHandler(
@@ -1872,39 +1772,86 @@ def main():
     )
 
     application.add_handler(
+        CommandHandler(
+            "statistics",
+            owner_statistics
+        )
+    )
+
+    application.add_handler(
+        driver_registration
+    )
+
+    application.add_handler(
+        ride_conversation
+    )
+
+    # ========================================================
+    # أزرار القوائم
+    # ========================================================
+
+    application.add_handler(
         MessageHandler(
-            filters.Regex("^📍 رحلتي الحالية$"),
+            filters.Regex("^🚕 راكب$"),
+            passenger_menu
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Regex("^🚗 سائق$"),
+            driver_menu
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Regex("^🟢 تشغيل$"),
+            driver_online
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Regex("^🔴 إيقاف$"),
+            driver_offline
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Regex("^📍 مشاركة موقعي$")
+            & filters.LOCATION,
+            driver_location
+        )
+    )
+
+    # مهم: استقبال أي Location من السائق
+    application.add_handler(
+        MessageHandler(
+            filters.LOCATION,
+            driver_location
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.Regex("^🚕 الرحلة الحالية$"),
             current_ride
         )
     )
 
     application.add_handler(
         MessageHandler(
-            filters.Regex("^🚕 حالة السائق$"),
-            driver_status
+            filters.Regex("^📊 إحصائياتي$"),
+            driver_statistics
         )
     )
 
     application.add_handler(
         MessageHandler(
-            filters.Regex("^📍 مشاركة موقعي$") &
-            filters.LOCATION,
-            driver_location
-        )
-    )
-
-    # استقبال موقع السائق حتى لو أرسله بدون الضغط على الزر
-    application.add_handler(
-        MessageHandler(
-            filters.LOCATION,
-            driver_location
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.Regex("^👤 بياناتي$"),
-            driver_info
+            filters.Regex("^📋 طلباتي$"),
+            passenger_rides
         )
     )
 
@@ -1915,57 +1862,42 @@ def main():
         )
     )
 
-    application.add_handler(
-        MessageHandler(
-            filters.Regex("^📊 إحصائيات$"),
-            statistics
-        )
-    )
-
-    # --------------------------------------------------------
-    # Callback buttons
-    # --------------------------------------------------------
+    # ========================================================
+    # أزرار قبول/رفض السائق
+    # ========================================================
 
     application.add_handler(
-
         CallbackQueryHandler(
             driver_approval,
-            pattern=r"^(approve|reject)_\d+$"
+            pattern=r"^(approve_driver_|reject_driver_)"
         )
-
     )
 
-    application.add_handler(
+    # ========================================================
+    # زر قبول الرحلة
+    # ========================================================
 
+    application.add_handler(
         CallbackQueryHandler(
             accept_ride,
-            pattern=r"^accept_\d+$"
+            pattern=r"^accept_ride_"
         )
-
     )
 
-    application.add_handler(
+    # ========================================================
+    # تشغيل
+    # ========================================================
 
-        CallbackQueryHandler(
-            ignore_ride,
-            pattern=r"^ignore_\d+$"
-        )
-
-    )
-
-    logger.info(
-        f"🚖 Waselni started - {CITY_NAME}"
-    )
+    logger.info("🚕 وصلني Bot is starting...")
 
     application.run_polling(
-        drop_pending_updates=True
+        allowed_updates=Update.ALL_TYPES
     )
 
 
 # ============================================================
-# Start
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
