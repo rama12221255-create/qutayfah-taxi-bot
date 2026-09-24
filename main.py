@@ -1,9 +1,26 @@
 import os
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# جلب البيانات الحساسة من متغيرات البيئة في السيرفر
+# خادم ويب وهمي لإرضاء فحص الصحة في Render
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+# تشغيل خادم الصحة في مسار جانبي (Thread)
+threading.Thread(target=run_health_server, daemon=True).start()
+
+# جلب البيانات الحساسة من متغيرات البيئة
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DRIVERS_GROUP_ID = int(os.environ.get("DRIVERS_GROUP_ID", 0))
 
@@ -28,7 +45,6 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("✅ قبول الرحلة", callback_data=f"accept_{order_id}")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # إرسال موقع الراكب لمجموعة السائقين
     await context.bot.send_location(
         chat_id=DRIVERS_GROUP_ID,
         latitude=location.latitude,
